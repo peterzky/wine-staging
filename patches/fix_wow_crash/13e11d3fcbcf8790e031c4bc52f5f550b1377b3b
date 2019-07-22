@@ -1,0 +1,164 @@
+From 13e11d3fcbcf8790e031c4bc52f5f550b1377b3b Mon Sep 17 00:00:00 2001
+From: Huw Davies <huw@codeweavers.com>
+Date: Thu, 30 May 2019 09:49:08 +0100
+Subject: [PATCH] kernel32: Move the implementation of GetTickCount() to
+ kernel32.
+
+Fixes regression caused by 3e927c4aec9dbeef930b83f62ee0651b8c147247.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=47265
+Signed-off-by: Huw Davies <huw@codeweavers.com>
+Signed-off-by: Alexandre Julliard <julliard@winehq.org>
+---
+ dlls/kernel32/kernel32.spec |  4 ++--
+ dlls/kernel32/time.c        | 57 +++++++++++++++++++++++++++++++++++++++++++++
+ dlls/ntdll/ntdll.spec       |  4 ++--
+ dlls/ntdll/ntdll_misc.h     |  4 ----
+ dlls/ntdll/time.c           |  2 +-
+ 5 files changed, 62 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/kernel32/kernel32.spec b/dlls/kernel32/kernel32.spec
+index 5f3f1fa..c01f132 100644
+--- a/dlls/kernel32/kernel32.spec
++++ b/dlls/kernel32/kernel32.spec
+@@ -858,8 +858,8 @@
+ @ stdcall GetThreadPriorityBoost(long ptr)
+ @ stdcall GetThreadSelectorEntry(long long ptr)
+ @ stdcall GetThreadTimes(long ptr ptr ptr ptr)
+-@ stdcall GetTickCount() ntdll.NtGetTickCount
+-@ stdcall -ret64 GetTickCount64() ntdll.NtGetTickCount
++@ stdcall GetTickCount()
++@ stdcall -ret64 GetTickCount64()
+ @ stdcall GetTimeFormatA(long long ptr str ptr long)
+ @ stdcall GetTimeFormatEx(wstr long ptr wstr ptr long)
+ @ stdcall GetTimeFormatW(long long ptr wstr ptr long)
+diff --git a/dlls/kernel32/time.c b/dlls/kernel32/time.c
+index 00fcc6b..737affc 100644
+--- a/dlls/kernel32/time.c
++++ b/dlls/kernel32/time.c
+@@ -38,6 +38,9 @@
+ #elif defined(HAVE_MACHINE_LIMITS_H)
+ #include <machine/limits.h>
+ #endif
++#ifdef __APPLE__
++# include <mach/mach_time.h>
++#endif
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -64,6 +67,33 @@ static inline LONGLONG filetime_to_longlong( const FILETIME *ft )
+     return (((LONGLONG)ft->dwHighDateTime) << 32) + ft->dwLowDateTime;
+ }
+ 
++#define TICKSPERSEC        10000000
++#define TICKSPERMSEC       10000
++
++/* return a monotonic time counter, in Win32 ticks */
++static inline ULONGLONG monotonic_counter(void)
++{
++    LARGE_INTEGER counter;
++
++#ifdef __APPLE__
++    static mach_timebase_info_data_t timebase;
++
++    if (!timebase.denom) mach_timebase_info( &timebase );
++    return mach_absolute_time() * timebase.numer / timebase.denom / 100;
++#elif defined(HAVE_CLOCK_GETTIME)
++    struct timespec ts;
++#ifdef CLOCK_MONOTONIC_RAW
++    if (!clock_gettime( CLOCK_MONOTONIC_RAW, &ts ))
++        return ts.tv_sec * (ULONGLONG)TICKSPERSEC + ts.tv_nsec / 100;
++#endif
++    if (!clock_gettime( CLOCK_MONOTONIC, &ts ))
++        return ts.tv_sec * (ULONGLONG)TICKSPERSEC + ts.tv_nsec / 100;
++#endif
++
++    NtQueryPerformanceCounter( &counter, NULL );
++    return counter.QuadPart;
++}
++
+ static const WCHAR mui_stdW[] = { 'M','U','I','_','S','t','d',0 };
+ static const WCHAR mui_dltW[] = { 'M','U','I','_','D','l','t',0 };
+ 
+@@ -1528,3 +1558,30 @@ BOOL WINAPI QueryUnbiasedInterruptTime(ULONGLONG *time)
+     RtlQueryUnbiasedInterruptTime(time);
+     return TRUE;
+ }
++
++/******************************************************************************
++ *           GetTickCount64       (KERNEL32.@)
++ */
++ULONGLONG WINAPI DECLSPEC_HOTPATCH GetTickCount64(void)
++{
++    return monotonic_counter() / TICKSPERMSEC;
++}
++
++/***********************************************************************
++ *           GetTickCount       (KERNEL32.@)
++ *
++ * Get the number of milliseconds the system has been running.
++ *
++ * PARAMS
++ *  None.
++ *
++ * RETURNS
++ *  The current tick count.
++ *
++ * NOTES
++ *  The value returned will wrap around every 2^32 milliseconds.
++ */
++DWORD WINAPI DECLSPEC_HOTPATCH GetTickCount(void)
++{
++    return monotonic_counter() / TICKSPERMSEC;
++}
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 050ebc7..aeb9735 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -194,7 +194,7 @@
+ @ stdcall NtGetCurrentProcessorNumber()
+ # @ stub NtGetDevicePowerState
+ @ stub NtGetPlugPlayEvent
+-@ stdcall -ret64 NtGetTickCount() get_tick_count64
++@ stdcall NtGetTickCount()
+ @ stdcall NtGetWriteWatch(long long ptr long ptr ptr ptr)
+ @ stdcall NtImpersonateAnonymousToken(long)
+ @ stub NtImpersonateClientOfPort
+@@ -1142,7 +1142,7 @@
+ @ stdcall -private ZwGetCurrentProcessorNumber() NtGetCurrentProcessorNumber
+ # @ stub ZwGetDevicePowerState
+ @ stub ZwGetPlugPlayEvent
+-@ stdcall -private -ret64 ZwGetTickCount() get_tick_count64
++@ stdcall -private ZwGetTickCount() NtGetTickCount
+ @ stdcall -private ZwGetWriteWatch(long long ptr long ptr ptr ptr) NtGetWriteWatch
+ @ stdcall -private ZwImpersonateAnonymousToken(long) NtImpersonateAnonymousToken
+ @ stub ZwImpersonateClientOfPort
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index 2d83f54..3463ebd 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -268,8 +268,4 @@ void     WINAPI LdrInitializeThunk(CONTEXT*,void**,ULONG_PTR,ULONG_PTR);
+ /* string functions */
+ int __cdecl NTDLL_tolower( int c );
+ int __cdecl _stricmp( LPCSTR str1, LPCSTR str2 );
+-
+-/* time functions */
+-ULONGLONG WINAPI get_tick_count64( void );
+-#define NtGetTickCount get_tick_count64
+ #endif
+diff --git a/dlls/ntdll/time.c b/dlls/ntdll/time.c
+index 41e4563..20de627 100644
+--- a/dlls/ntdll/time.c
++++ b/dlls/ntdll/time.c
+@@ -557,7 +557,7 @@ NTSTATUS WINAPI NtQueryPerformanceCounter( LARGE_INTEGER *counter, LARGE_INTEGER
+  * NtGetTickCount   (NTDLL.@)
+  * ZwGetTickCount   (NTDLL.@)
+  */
+-ULONGLONG WINAPI DECLSPEC_HOTPATCH get_tick_count64(void)
++ULONG WINAPI NtGetTickCount(void)
+ {
+     return monotonic_counter() / TICKSPERMSEC;
+ }
+-- 
+2.1.4
+
